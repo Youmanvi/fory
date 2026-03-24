@@ -341,6 +341,21 @@ class FieldType:
         )
 
 
+def _create_declared_serializer(resolver, type_):
+    if type_ is None:
+        return None
+    if isinstance(type_, list):
+        type_ = type_[0] if type_ else None
+    elif isinstance(type_, tuple):
+        type_ = type_[0] if type_ else None
+    if type_ is None or type_ is typing.Any:
+        return None
+    try:
+        return resolver.get_type_info(cls=type_).serializer
+    except Exception:
+        return None
+
+
 class CollectionFieldType(FieldType):
     def __init__(
         self,
@@ -367,6 +382,8 @@ class CollectionFieldType(FieldType):
         elif type_ and len(type_) >= 2:
             elem_type = type_[1]
         elem_serializer = self.element_type.create_serializer(resolver, elem_type)
+        if elem_serializer is None:
+            elem_serializer = _create_declared_serializer(resolver, elem_type)
         elem_override = getattr(self.element_type, "tracking_ref_override", None)
         if self.type_id == TypeId.LIST:
             if declared_root_type in (tuple, typing.Tuple):
@@ -400,6 +417,10 @@ class MapFieldType(FieldType):
             value_type = type_[2]
         key_serializer = self.key_type.create_serializer(resolver, key_type)
         value_serializer = self.value_type.create_serializer(resolver, value_type)
+        if key_serializer is None:
+            key_serializer = _create_declared_serializer(resolver, key_type)
+        if value_serializer is None:
+            value_serializer = _create_declared_serializer(resolver, value_type)
         key_override = getattr(self.key_type, "tracking_ref_override", None)
         value_override = getattr(self.value_type, "tracking_ref_override", None)
         from pyfory.serializer import MapSerializer

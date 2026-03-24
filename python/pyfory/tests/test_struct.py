@@ -27,7 +27,8 @@ import typing
 import pyfory
 from pyfory import Fory
 from pyfory.error import TypeUnregisteredError
-from pyfory.struct import DataClassSerializer, build_default_values_factory
+from pyfory.struct import DataClassSerializer, StructFieldSerializerVisitor, build_default_values_factory
+from pyfory.type_util import get_type_hints, infer_field
 from pyfory.types import TypeId
 
 
@@ -827,6 +828,16 @@ class CompatibleAllTypesV2:
     f_new: str = "default"
 
 
+@dataclass
+class CompatibleNestedItem:
+    value: str = ""
+
+
+@dataclass
+class CompatibleNestedContainer:
+    nested: List[pyfory.Ref[CompatibleNestedItem, False]] = dataclasses.field(default_factory=list)
+
+
 @pytest.mark.parametrize("xlang", [False, True])
 def test_compatible_mode_all_basic_types(xlang):
     """Test compatible mode with all basic types."""
@@ -897,6 +908,33 @@ def test_optional_compatible_mode_evolution():
     assert v1_result.f1 == 300
     assert v1_result.f2 == "test3"
     assert v1_result.f3 is None
+
+
+def test_compatible_nested_declared_struct_collection_serializer_matches_direct_inference():
+    fory = Fory(xlang=True, ref=True, compatible=True, strict=False)
+    fory.register_type(CompatibleNestedItem, typename="example.CompatibleNestedItem")
+    fory.register_type(CompatibleNestedContainer, typename="example.CompatibleNestedContainer")
+
+    obj = CompatibleNestedContainer(
+        nested=[CompatibleNestedItem("abc"), CompatibleNestedItem("def")]
+    )
+    registered_serializer = fory.type_resolver.get_type_info(CompatibleNestedContainer).serializer._serializers[0]
+    direct_serializer = infer_field(
+        "nested",
+        get_type_hints(CompatibleNestedContainer)["nested"],
+        StructFieldSerializerVisitor(fory),
+        types_path=[],
+    )
+
+    registered_buffer = pyfory.Buffer.allocate(128)
+    direct_buffer = pyfory.Buffer.allocate(128)
+    registered_serializer.write(registered_buffer, obj.nested)
+    direct_serializer.write(direct_buffer, obj.nested)
+
+    assert registered_buffer.to_bytes(0, registered_buffer.get_writer_index()) == direct_buffer.to_bytes(
+        0, direct_buffer.get_writer_index()
+    )
+    assert ser_de(fory, obj) == obj
 
 
 # ============================================================================
