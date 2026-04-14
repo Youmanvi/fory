@@ -938,6 +938,266 @@ def test_compatible_nested_declared_struct_collection_serializer_matches_direct_
 
 
 # ============================================================================
+# Tests for compatible xlang collection wire-format validation
+# ============================================================================
+
+
+def _get_field_serializer(fory, cls, field_name):
+    """Return the registered field serializer for a named field, regardless of sort order."""
+    s = fory.type_resolver.get_type_info(cls).serializer
+    idx = s._field_names.index(field_name)
+    return s._serializers[idx]
+
+
+def _buf_bytes(buf):
+    return buf.to_bytes(0, buf.get_writer_index())
+
+
+def _compare_field_bytes(fory, cls, field_name, value):
+    """
+    Assert that the compatible-reconstructed serializer and the direct-inferred
+    serializer write identical bytes for *value*.  Returns the bytes so callers
+    can do further inspection.
+    """
+    registered_ser = _get_field_serializer(fory, cls, field_name)
+    direct_ser = infer_field(
+        field_name,
+        get_type_hints(cls)[field_name],
+        StructFieldSerializerVisitor(fory),
+        types_path=[],
+    )
+    reg_buf = pyfory.Buffer.allocate(256)
+    dir_buf = pyfory.Buffer.allocate(256)
+    registered_ser.write(reg_buf, value)
+    direct_ser.write(dir_buf, value)
+    reg_bytes = _buf_bytes(reg_buf)
+    dir_bytes = _buf_bytes(dir_buf)
+    assert reg_bytes == dir_bytes, (
+        f"Field '{field_name}': compatible serializer wrote {reg_bytes.hex()!r} "
+        f"but direct inference wrote {dir_bytes.hex()!r}"
+    )
+    return reg_bytes
+
+
+# --- dataclasses for wire-format validation tests ---
+
+@dataclass
+class MapValueItem:
+    label: str = ""
+
+
+@dataclass
+class MapValueContainer:
+    lookup: Dict[str, pyfory.Ref[MapValueItem, False]] = dataclasses.field(default_factory=dict)
+
+
+@dataclass
+class MultiCollectionItem:
+    x: int = 0
+
+
+@dataclass
+class MultiCollectionContainer:
+    items: List[pyfory.Ref[MultiCollectionItem, False]] = dataclasses.field(default_factory=list)
+    lookup: Dict[str, pyfory.Ref[MultiCollectionItem, False]] = dataclasses.field(default_factory=dict)
+
+
+@dataclass
+class EvolutionNestedItem:
+    value: str = ""
+
+
+@dataclass
+class EvolutionContainerV1:
+    name: str = ""
+
+
+@dataclass
+class EvolutionContainerV2:
+    name: str = ""
+    items: List[pyfory.Ref[EvolutionNestedItem, False]] = dataclasses.field(default_factory=list)
+    metadata: Dict[str, pyfory.Ref[EvolutionNestedItem, False]] = dataclasses.field(default_factory=dict)
+
+
+@dataclass
+class RefOverrideItem:
+    value: str = ""
+
+
+@dataclass
+class RefOnContainer:
+    items: List[pyfory.Ref[RefOverrideItem, True]] = dataclasses.field(default_factory=list)
+
+
+@dataclass
+class RefOffContainer:
+    items: List[pyfory.Ref[RefOverrideItem, False]] = dataclasses.field(default_factory=list)
+
+
+def test_compatible_map_declared_struct_value_serializer_matches_direct_inference():
+    """
+    Dict[str, Ref[Struct, False]] — the map-value path of the same bug fixed for
+    lists.  The compatible-rebuilt MapSerializer must produce identical bytes to
+    direct field inference.
+    """
+    fory = Fory(xlang=True, ref=True, compatible=True, strict=False)
+    fory.register_type(MapValueItem, typename="example.MapValueItem")
+    fory.register_type(MapValueContainer, typename="example.MapValueContainer")
+
+    obj = MapValueContainer(lookup={"a": MapValueItem("alpha"), "b": MapValueItem("beta")})
+    _compare_field_bytes(fory, MapValueContainer, "lookup", obj.lookup)
+    assert ser_de(fory, obj) == obj
+
+
+def test_compatible_map_declared_struct_value_empty_map():
+    """Empty Dict[str, Ref[Struct, False]] must round-trip and produce matching bytes."""
+    fory = Fory(xlang=True, ref=True, compatible=True, strict=False)
+    fory.register_type(MapValueItem, typename="example.MapValueItem")
+    fory.register_type(MapValueContainer, typename="example.MapValueContainer")
+
+    obj = MapValueContainer(lookup={})
+    _compare_field_bytes(fory, MapValueContainer, "lookup", obj.lookup)
+    assert ser_de(fory, obj) == obj
+
+
+def test_compatible_multi_field_collection_serializers_match_direct_inference():
+    """
+    Every collection field (List and Dict) in a struct must independently produce
+    identical bytes between compatible reconstruction and direct inference.
+    """
+    fory = Fory(xlang=True, ref=True, compatible=True, strict=False)
+    fory.register_type(MultiCollectionItem, typename="example.MultiCollectionItem")
+    fory.register_type(MultiCollectionContainer, typename="example.MultiCollectionContainer")
+
+    obj = MultiCollectionContainer(
+        items=[MultiCollectionItem(1), MultiCollectionItem(2)],
+        lookup={"x": MultiCollectionItem(10), "y": MultiCollectionItem(20)},
+    )
+
+    _compare_field_bytes(fory, MultiCollectionContainer, "items", obj.items)
+    _compare_field_bytes(fory, MultiCollectionContainer, "lookup", obj.lookup)
+    assert ser_de(fory, obj) == obj
+
+
+def test_compatible_struct_collection_schema_evolution_add_list_and_map_fields():
+    """
+    V2 adds List[Ref[T, False]] and Dict[str, Ref[T, False]] fields.
+
+    Forward (V1→V2): missing collection fields default to empty.
+    Backward (V2→V1): extra fields in the binary are silently skipped.
+    V2→V2 full round-trip must be lossless.
+    """
+    fory_v1 = Fory(xlang=True, ref=True, compatible=True, strict=False)
+    fory_v2 = Fory(xlang=True, ref=True, compatible=True, strict=False)
+
+    fory_v1.register_type(EvolutionContainerV1, typename="example.EvolutionContainer")
+
+    fory_v2.register_type(EvolutionNestedItem, typename="example.EvolutionNestedItem")
+    fory_v2.register_type(EvolutionContainerV2, typename="example.EvolutionContainer")
+
+    # Forward: V1 binary is read by V2 — new collection fields must default to empty
+    v1_obj = EvolutionContainerV1(name="forward")
+    v1_binary = fory_v1.serialize(v1_obj)
+    v2_result = fory_v2.deserialize(v1_binary)
+    assert v2_result.name == "forward"
+    assert v2_result.items == []
+    assert v2_result.metadata == {}
+
+    # V2 full round-trip
+    item_a = EvolutionNestedItem(value="a")
+    item_b = EvolutionNestedItem(value="b")
+    v2_obj = EvolutionContainerV2(
+        name="roundtrip",
+        items=[item_a, item_b],
+        metadata={"k": item_a},
+    )
+    assert ser_de(fory_v2, v2_obj) == v2_obj
+
+    # Backward: V2 binary with populated collections is read by V1 — extra fields skipped
+    v2_binary = fory_v2.serialize(v2_obj)
+    v1_result = fory_v1.deserialize(v2_binary)
+    assert v1_result.name == "roundtrip"
+
+
+def test_compatible_ref_tracking_override_false_serializer_matches_direct_inference():
+    """
+    Ref[T, False] suppresses per-element ref metadata.  Compatible reconstruction
+    must produce the same bytes as direct inference, and the round-trip must work.
+    """
+    fory = Fory(xlang=True, ref=True, compatible=True, strict=False)
+    fory.register_type(RefOverrideItem, typename="example.RefOverrideItem")
+    fory.register_type(RefOffContainer, typename="example.RefOffContainer")
+
+    obj = RefOffContainer(items=[RefOverrideItem("x"), RefOverrideItem("y")])
+    _compare_field_bytes(fory, RefOffContainer, "items", obj.items)
+    assert ser_de(fory, obj) == obj
+
+
+def test_compatible_ref_tracking_override_true_serializer_matches_direct_inference():
+    """
+    Ref[T, True] enables per-element ref tracking.  Compatible reconstruction must
+    produce the same bytes as direct inference, and shared-reference objects must
+    survive a full round-trip.
+    """
+    fory = Fory(xlang=True, ref=True, compatible=True, strict=False)
+    fory.register_type(RefOverrideItem, typename="example.RefOverrideItem")
+    fory.register_type(RefOnContainer, typename="example.RefOnContainer")
+
+    obj = RefOnContainer(items=[RefOverrideItem("p"), RefOverrideItem("q")])
+    _compare_field_bytes(fory, RefOnContainer, "items", obj.items)
+    assert ser_de(fory, obj) == obj
+
+    # Shared reference: the same object appears twice in the list
+    shared = RefOverrideItem("shared")
+    obj_shared = RefOnContainer(items=[shared, shared])
+    assert ser_de(fory, obj_shared) == obj_shared
+
+
+def test_compatible_ref_tracking_override_false_produces_shorter_output_than_true():
+    """
+    Ref[T, False] must produce a strictly smaller wire payload than Ref[T, True]
+    for the same non-trivial list, because it omits per-element ref headers.
+    """
+    fory_off = Fory(xlang=True, ref=True, compatible=True, strict=False)
+    fory_off.register_type(RefOverrideItem, typename="example.RefOverrideItem")
+    fory_off.register_type(RefOffContainer, typename="example.RefOffContainer")
+
+    fory_on = Fory(xlang=True, ref=True, compatible=True, strict=False)
+    fory_on.register_type(RefOverrideItem, typename="example.RefOverrideItem")
+    fory_on.register_type(RefOnContainer, typename="example.RefOnContainer")
+
+    items = [RefOverrideItem("x"), RefOverrideItem("y"), RefOverrideItem("z")]
+    off_obj = RefOffContainer(items=items)
+    on_obj = RefOnContainer(items=items)
+
+    # Serialize both and strip the outer fory envelope to compare payload sizes
+    off_bytes = fory_off.serialize(off_obj)
+    on_bytes = fory_on.serialize(on_obj)
+    assert len(off_bytes) < len(on_bytes), (
+        f"Expected Ref[T, False] ({len(off_bytes)}B) < Ref[T, True] ({len(on_bytes)}B)"
+    )
+
+
+def test_compatible_nested_struct_collection_boundary_sizes():
+    """
+    The compatible serializer must produce identical bytes to direct inference for
+    empty, single-element, and multi-element lists.
+    """
+    fory = Fory(xlang=True, ref=True, compatible=True, strict=False)
+    fory.register_type(CompatibleNestedItem, typename="example.CompatibleNestedItem")
+    fory.register_type(CompatibleNestedContainer, typename="example.CompatibleNestedContainer")
+
+    for value in [
+        [],
+        [CompatibleNestedItem("only")],
+        [CompatibleNestedItem("a"), CompatibleNestedItem("b"), CompatibleNestedItem("c")],
+    ]:
+        obj = CompatibleNestedContainer(nested=value)
+        _compare_field_bytes(fory, CompatibleNestedContainer, "nested", value)
+        assert ser_de(fory, obj) == obj
+
+
+# ============================================================================
 # Tests for dynamic field configuration
 # ============================================================================
 
